@@ -1,0 +1,247 @@
+Shader "Custom/URP/BaseUnlitTessGeo"
+{
+    Properties
+    {
+        [MainTexture] _BaseMap ("Base Map", 2D) = "white" {}
+        [MainColor]  _BaseColor ("Base Color", Color) = (1,1,1,1)
+
+        _Tessellation ("Tessellation", Range(1, 32)) = 1
+        _Displacement ("Displacement", Range(0, 1)) = 0
+    }
+
+    SubShader
+    {
+        Tags
+        {
+            "RenderType" = "Opaque"
+            "RenderPipeline" = "UniversalPipeline"
+        }
+
+        Pass
+        {
+            Name "Forward"
+            Tags { "LightMode" = "UniversalForward" }
+
+            Cull Off
+
+            HLSLPROGRAM
+            #pragma target 5.0
+
+            // 着色器阶段指定
+            #pragma vertex TessellationVertex
+            #pragma hull Hull
+            #pragma domain Domain
+            #pragma geometry Geometry
+            #pragma fragment Frag
+
+            #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+
+            // 纹理与采样器
+            TEXTURE2D(_BaseMap);
+            SAMPLER(sampler_BaseMap);
+
+            // 材质属性（SRP Batcher 兼容）
+            CBUFFER_START(UnityPerMaterial)
+                float4 _BaseMap_ST;
+                half4 _BaseColor;
+                float _Tessellation;
+                float _Displacement;
+            CBUFFER_END
+
+            // 结构体定义
+
+            // 原始顶点数据（输入给顶点着色器）
+            struct Attributes
+            {
+                float4 positionOS : POSITION;
+                float3 normalOS   : NORMAL;
+                float4 tangentOS  : TANGENT;
+                float2 uv0        : TEXCOORD0;
+                float2 uv1        : TEXCOORD1;
+                half4 color       : COLOR;
+                UNITY_VERTEX_INPUT_INSTANCE_ID
+            };
+
+            // 曲面细分控制点（从顶点着色器输出，传给 Hull Shader）
+            struct ControlPoint
+            {
+                float3 positionWS : INTERNALTESSPOS;   // 世界空间位置（曲面细分要求）
+                float3 normalWS   : NORMAL;
+                float4 tangentWS  : TANGENT;
+                float2 uv0        : TEXCOORD0;
+                float2 uv1        : TEXCOORD1;
+                half4 color       : COLOR;
+            };
+
+            // 细分因子（Patch Constant Function 输出）
+            struct TessellationFactors
+            {
+                float edge[3] : SV_TessFactor;
+                float inside  : SV_InsideTessFactor;
+            };
+
+            // 几何着色器输入（从 Domain Shader 输出，并传给几何着色器）
+            struct GeometryInput
+            {
+                float4 positionCS : SV_POSITION;
+                float2 uv0        : TEXCOORD0;
+                float2 uv1        : TEXCOORD1;
+                half4 color       : COLOR;
+                float3 normalWS   : NORMAL;
+            };
+
+            // 片元着色器输入（从几何着色器输出）
+            struct Varyings
+            {
+                float4 positionCS : SV_POSITION;
+                float2 uv0        : TEXCOORD0;
+                float2 uv1        : TEXCOORD1;
+                half4 color       : COLOR;
+                half  fogCoord    : TEXCOORD1;   // 复用 TEXCOORD1 传递雾效因子
+                float3 normalWS   : NORMAL;
+            };
+
+            // 顶点着色器 → 输出控制点（无变换，仅传递世界空间数据）
+            ControlPoint TessellationVertex(Attributes IN)
+            {
+                ControlPoint OUT;
+                UNITY_SETUP_INSTANCE_ID(IN);
+
+                // 世界空间变换
+                OUT.positionWS = TransformObjectToWorld(IN.positionOS.xyz);
+                OUT.normalWS   = TransformObjectToWorldNormal(IN.normalOS);
+                OUT.tangentWS  = float4(TransformObjectToWorldDir(IN.tangentOS.xyz), IN.tangentOS.w);
+
+                // UV 和颜色
+                OUT.uv0 = IN.uv0;
+                OUT.uv1 = IN.uv1;
+                OUT.color = IN.color;
+                return OUT;
+            }
+
+            // Patch Constant Function → 计算细分因子
+            TessellationFactors PatchConstant(InputPatch<ControlPoint, 3> patch)
+            {
+                TessellationFactors f;
+                // 固定细分等级，演示用（可从材质属性或距离动态计算）
+                f.edge[0] = _Tessellation;
+                f.edge[1] = _Tessellation;
+                f.edge[2] = _Tessellation;
+                f.inside  = _Tessellation;
+                return f;
+            }
+
+            // Hull Shader
+            [domain("tri")]
+            [partitioning("integer")]          // 或 fractional_odd / fractional_even
+            [outputtopology("triangle_cw")]
+            [patchconstantfunc("PatchConstant")]
+            [outputcontrolpoints(3)]
+            ControlPoint Hull(InputPatch<ControlPoint, 3> patch, uint id : SV_OutputControlPointID)
+            {
+                return patch[id];
+            }
+
+            // Domain Shader → 生成最终顶点，并输出给几何着色器
+            [domain("tri")]
+            GeometryInput Domain(
+                TessellationFactors factors,
+                const OutputPatch<ControlPoint, 3> patch,
+                float3 bary : SV_DomainLocation)
+            {
+                GeometryInput OUT;
+
+                // 重心坐标插值世界空间位置、法线、切线
+                float3 positionWS = patch[0].positionWS * bary.x + patch[1].positionWS * bary.y + patch[2].positionWS * bary.z;
+                float3 normalWS   = normalize(patch[0].normalWS   * bary.x + patch[1].normalWS   * bary.y + patch[2].normalWS   * bary.z);
+                float4 tangentWS  = normalize(patch[0].tangentWS  * bary.x + patch[1].tangentWS  * bary.y + patch[2].tangentWS  * bary.z);
+                float2 uv0        = patch[0].uv0 * bary.x + patch[1].uv0 * bary.y + patch[2].uv0 * bary.z;
+                float2 uv1        = patch[0].uv1 * bary.x + patch[1].uv1 * bary.y + patch[2].uv1 * bary.z;
+                half4 color       = patch[0].color * bary.x + patch[1].color * bary.y + patch[2].color * bary.z;
+
+                // 可选的位移（沿法线方向）
+                // positionWS += normalWS * _Displacement * 0.1;
+
+                // 变换到裁剪空间
+                OUT.positionCS = TransformWorldToHClip(positionWS);
+                OUT.uv0 = uv0;
+                OUT.uv1 = uv1;
+                OUT.color = color;
+                OUT.normalWS = normalWS;
+                return OUT;
+            }
+
+            // 几何着色器 → 接收一个三角形，输出三角形（此处为直通）
+            [maxvertexcount(3)]
+            void Geometry(triangle GeometryInput input[3], inout TriangleStream<Varyings> triStream)
+            {
+                Varyings o;
+
+                // 计算雾效因子（可在几何着色器中任意阶段计算，这里取第一个顶点的Z）
+                half fogFactor = ComputeFogFactor(input[0].positionCS.z);
+
+                for (int i = 0; i < 3; i++)
+                {
+                    o.positionCS = input[i].positionCS;
+                    o.uv0        = input[i].uv0;
+                    o.uv1        = input[i].uv1;
+                    o.color      = input[i].color;
+                    o.normalWS   = input[i].normalWS;
+                    o.fogCoord   = fogFactor;   // 或者每个顶点单独计算
+                    triStream.Append(o);
+                }
+                triStream.RestartStrip();
+            }
+
+            // 片元着色器
+            half4 Frag(Varyings IN) : SV_Target
+            {
+                half4 texColor = SAMPLE_TEXTURE2D(_BaseMap, sampler_BaseMap, IN.uv0);
+                half4 color = texColor * _BaseColor * IN.color;
+
+                // URP 雾效混合
+                color.rgb = MixFog(color.rgb, IN.fogCoord);
+                return color;
+            }
+            ENDHLSL
+        }
+
+        // 阴影投射 Pass（曲面细分同样可能影响阴影，此处保持简单，仅使用标准实现）
+        Pass
+        {
+            Name "ShadowCaster"
+            Tags { "LightMode" = "ShadowCaster" }
+
+            ZWrite On
+            ZTest LEqual
+            ColorMask 0
+
+            HLSLPROGRAM
+            #pragma vertex ShadowPassVertex
+            #pragma fragment ShadowPassFragment
+
+            #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+            #include "Packages/com.unity.render-pipelines.universal/Shaders/ShadowCasterPass.hlsl"
+            ENDHLSL
+        }
+
+        // 深度写入 Pass
+        Pass
+        {
+            Name "DepthOnly"
+            Tags { "LightMode" = "DepthOnly" }
+
+            ZWrite On
+            ColorMask R
+
+            HLSLPROGRAM
+            #pragma vertex DepthOnlyVertex
+            #pragma fragment DepthOnlyFragment
+
+            #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+            #include "Packages/com.unity.render-pipelines.universal/Shaders/DepthOnlyPass.hlsl"
+            ENDHLSL
+        }
+    }
+    FallBack "Hidden/Universal Render Pipeline/FallbackError"
+}
